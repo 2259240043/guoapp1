@@ -165,21 +165,30 @@ class LunaExoPlayer implements Player {
       throw Exception('无效的播放地址: $url');
     }
 
-    // 先导探测：如果尚未显式判定为 HLS，向网络地址快速嗅探前置响应头与内容，智能识别
-    if (!isHls && uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+    // 前置嗅探探测：无条件向网络地址快速嗅探响应头与首块数据，精准排查并识别流类型
+    if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
       try {
-        final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
+        final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
         final req = await client.getUrl(uri);
         headers.forEach((k, v) => req.headers.set(k, v));
-        req.headers.set('Range', 'bytes=0-512');
-        final resp = await req.close();
+        req.headers.set('Range', 'bytes=0-1024');
+        final resp = await req.close().timeout(const Duration(seconds: 2));
         final cType = resp.headers.contentType?.toString().toLowerCase() ?? '';
+        final appError = resp.headers.value('x-app-error') ?? '';
         final chunks = await resp.take(1).toList();
         final firstChunk = chunks.isNotEmpty ? String.fromCharCodes(chunks.first) : '';
-        DiaryService.add('[Sniff] 探测结果: status=${resp.statusCode}, contentType=$cType, prefix=${firstChunk.length > 20 ? firstChunk.substring(0, 20) : firstChunk}');
+        final preview = firstChunk.replaceAll('\r', '').replaceAll('\n', ' ');
+        final shortPreview = preview.length > 60 ? preview.substring(0, 60) : preview;
+        DiaryService.add('[Sniff] 探测: code=${resp.statusCode}, type=$cType, errHeader=$appError, prefix=$shortPreview');
+        if (resp.statusCode != 200 && resp.statusCode != 206) {
+          DiaryService.add('[Sniff] 警告: 代理响应异常 (${resp.statusCode}) 内容: $shortPreview');
+        }
         if (cType.contains('mpegurl') || firstChunk.contains('#EXTM3U')) {
           isHls = true;
-          DiaryService.add('[Sniff] 自动识别为 HLS 流，注入 formatHint: VideoFormat.hls');
+          DiaryService.add('[Sniff] 识别为 HLS 流，设置 formatHint: VideoFormat.hls');
+        } else if (cType.contains('mp4') || firstChunk.contains('ftyp') || firstChunk.contains('moov')) {
+          isHls = false;
+          DiaryService.add('[Sniff] 识别为 MP4 直链，清除 formatHint (以普通流播放)');
         }
         client.close(force: true);
       } catch (e) {

@@ -1045,7 +1045,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         _plan = plan;
         installed = true;
         _acceptErrors = true;
-        DiaryService.add('[Play] 调用 _player.open: url=${plan.url}, headers=${plan.headers.keys.toList()}');
+        DiaryService.add('[Play] 调用 _player.open: url=${plan.url}, cencKey=${plan.decryptionKey.isNotEmpty ? "已配(长度:${plan.decryptionKey.length})" : "无(明文)"}, quality=${plan.quality}, headers=${plan.headers.keys.toList()}');
         await _player.open(
           Media(
             plan.url,
