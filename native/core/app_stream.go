@@ -96,11 +96,14 @@ func (stream *nativeStreamServer) nativeOpen(media providerMedia) (string, strin
 	stream.sessions[token] = session
 	stream.mu.Unlock()
 	entry := nativeStreamAsset{address: media.URL, contentType: "video/mp4"}
-	isHLS := media.Playlist != "" || len(media.HLSKey) > 0 || strings.Contains(strings.ToLower(media.URL), "m3u8") || strings.Contains(strings.ToLower(media.URL), "hls")
-	if isHLS {
-		entry.contentType = "application/vnd.apple.mpegurl"
+	isHLS := media.Playlist != "" || len(media.HLSKey) > 0
+	if parsed, err := url.Parse(media.URL); err == nil {
+		pathLower := strings.ToLower(parsed.Path)
+		if strings.HasSuffix(pathLower, ".m3u8") {
+			isHLS = true
+		}
 	}
-	if parsed, err := url.Parse(media.URL); err == nil && strings.HasSuffix(strings.ToLower(parsed.Path), ".m3u8") {
+	if isHLS {
 		entry.contentType = "application/vnd.apple.mpegurl"
 	}
 	if media.Playlist != "" {
@@ -341,17 +344,29 @@ func (stream *nativeStreamServer) nativeServe(writer http.ResponseWriter, reques
 			return
 		}
 		text := strings.TrimSpace(strings.TrimPrefix(string(body), "\ufeff"))
-		if !strings.HasPrefix(text, "#EXTM3U") {
-			http.Error(writer, "播放列表无效", http.StatusBadGateway)
+		if strings.HasPrefix(text, "#EXTM3U") {
+			rewritten, err := stream.nativeRewrite(parts[0], session, text, finalURL.String())
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusBadGateway)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = io.WriteString(writer, rewritten)
 			return
 		}
-		rewritten, err := stream.nativeRewrite(parts[0], session, text, finalURL.String())
-		if err != nil {
-			http.Error(writer, err.Error(), http.StatusBadGateway)
-			return
+		// 若上游响应并非以 #EXTM3U 开头的播放列表，则代表实际为普通二进制媒体流（如 MP4）！
+		// 严禁抛出 502 错误，将已读取的 body 与 reader 拼合无缝输出普通媒体响应
+		fullReader := io.MultiReader(bytes.NewReader(body), reader)
+		for _, name := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+			if value := response.Header.Get(name); value != "" {
+				writer.Header().Set(name, value)
+			}
 		}
-		writer.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		_, _ = io.WriteString(writer, rewritten)
+		if !strings.Contains(strings.ToLower(writer.Header().Get("Content-Type")), "video") {
+			writer.Header().Set("Content-Type", "video/mp4")
+		}
+		writer.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(writer, fullReader)
 		return
 	}
 	for _, name := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
