@@ -1042,6 +1042,9 @@ class _PlayerScreenState extends State<PlayerScreen>
           );
           await platform.setProperty('network-timeout', '20');
         }
+        if (_player is LunaExoPlayer) {
+          (_player as LunaExoPlayer).setDecryptionKey(plan.decryptionKey);
+        }
         _plan = plan;
         installed = true;
         _acceptErrors = true;

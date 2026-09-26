@@ -5,6 +5,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit/src/models/player_log.dart';
 import 'package:media_kit/src/models/player_stream.dart';
 import 'package:media_kit/src/player/platform_player.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 import 'package:video_player/video_player.dart';
 import 'diary_service.dart';
 
@@ -94,6 +95,19 @@ class LunaExoPlayer implements Player {
   VoidCallback? _valueListener;
   Timer? _positionPollTimer;
 
+  Player? _fallbackPlayer;
+  VideoController? _fallbackVideoController;
+  final List<StreamSubscription> _fallbackSubs = [];
+  bool _isUsingFallback = false;
+  String? _decryptionKey;
+
+  bool get isUsingFallback => _isUsingFallback;
+  VideoController? get fallbackVideoController => _fallbackVideoController;
+
+  void setDecryptionKey(String key) {
+    _decryptionKey = key.trim();
+  }
+
   int _openGeneration = 0;
   bool _disposed = false;
 
@@ -106,7 +120,7 @@ class LunaExoPlayer implements Player {
   final LunaPlayerStreams stream = LunaPlayerStreams();
 
   @override
-  PlatformPlayer? get platform => null;
+  PlatformPlayer? get platform => _isUsingFallback ? _fallbackPlayer?.platform : null;
 
   @override
   Future<int> get handle => Future<int>.value(0);
@@ -124,6 +138,20 @@ class LunaExoPlayer implements Player {
 
     final myGen = ++_openGeneration;
     _positionPollTimer?.cancel();
+
+    // 如果检测到 CENC 解密密钥，由于 ExoPlayer Flutter 插件不支持解密裸 key，直接路由至硬件解密引擎
+    if (_decryptionKey != null && _decryptionKey!.isNotEmpty) {
+      DiaryService.add('[ExoPlayer] 检测到 CENC 解密密钥 (长度: ${_decryptionKey!.length})，无缝切换至 NativePlayer 硬件解密引擎...');
+      await _openWithFallback(media, play: play);
+      return;
+    }
+
+    _isUsingFallback = false;
+    if (_fallbackPlayer != null) {
+      try {
+        await _fallbackPlayer!.pause();
+      } catch (_) {}
+    }
 
     // 切换新节目时，旧控制器先静音/暂停，彻底防止新旧双重音频重叠
     final old = _controller;
@@ -247,24 +275,36 @@ class LunaExoPlayer implements Player {
           formatHint = alternateFormat;
           DiaryService.add('[ExoPlayer] 自愈重试成功! duration=${c.value.duration}');
         } catch (retryErr, retryStack) {
-          DiaryService.add('[ExoPlayer] 自愈重试依然失败! 异常: $retryErr\n堆栈: $retryStack');
-          if (myGen == _openGeneration) {
-            _safeAdd(stream.errorController, retryErr.toString());
-          }
+          DiaryService.add('[ExoPlayer] 自愈重试依然失败! 异常: $retryErr，启动 NativePlayer 终极硬件自愈引擎...');
           try {
             await c.dispose();
           } catch (_) {}
-          rethrow;
+          try {
+            await _openWithFallback(media, play: play);
+            return;
+          } catch (fallbackErr, fallbackStack) {
+            DiaryService.add('[ExoPlayer] 终极自愈依然失败: $fallbackErr\n堆栈: $fallbackStack');
+            if (myGen == _openGeneration) {
+              _safeAdd(stream.errorController, fallbackErr.toString());
+            }
+            rethrow;
+          }
         }
       } else {
-        DiaryService.add('[ExoPlayer] c.initialize() 失败! 异常: $e\n堆栈: $stack');
-        if (myGen == _openGeneration) {
-          _safeAdd(stream.errorController, e.toString());
-        }
+        DiaryService.add('[ExoPlayer] c.initialize() 失败! 异常: $e，启动 NativePlayer 终极硬件自愈引擎...');
         try {
           await c.dispose();
         } catch (_) {}
-        rethrow;
+        try {
+          await _openWithFallback(media, play: play);
+          return;
+        } catch (fallbackErr, fallbackStack) {
+          DiaryService.add('[ExoPlayer] 终极自愈依然失败: $fallbackErr\n堆栈: $fallbackStack');
+          if (myGen == _openGeneration) {
+            _safeAdd(stream.errorController, fallbackErr.toString());
+          }
+          rethrow;
+        }
       }
     }
 
@@ -394,8 +434,150 @@ class LunaExoPlayer implements Player {
     }
   }
 
+  Future<void> _ensureFallbackInitialized() async {
+    if (_fallbackPlayer != null) return;
+
+    final p = Player(
+      configuration: const PlayerConfiguration(
+        bufferSize: 32 * 1024 * 1024,
+        logLevel: MPVLogLevel.error,
+      ),
+    );
+    _fallbackPlayer = p;
+    _fallbackVideoController = VideoController(
+      p,
+      configuration: VideoControllerConfiguration(
+        enableHardwareAcceleration: !Platform.isIOS,
+      ),
+    );
+
+    _fallbackSubs.add(p.stream.position.listen((pos) {
+      if (!_isUsingFallback) return;
+      state = state.copyWith(position: pos);
+      _safeAdd(stream.positionController, pos);
+    }));
+
+    _fallbackSubs.add(p.stream.duration.listen((dur) {
+      if (!_isUsingFallback) return;
+      state = state.copyWith(duration: dur);
+      _safeAdd(stream.durationController, dur);
+      revision.value++;
+    }));
+
+    _fallbackSubs.add(p.stream.buffer.listen((buf) {
+      if (!_isUsingFallback) return;
+      state = state.copyWith(buffer: buf);
+      _safeAdd(stream.bufferController, buf);
+    }));
+
+    _fallbackSubs.add(p.stream.playing.listen((pl) {
+      if (!_isUsingFallback) return;
+      state = state.copyWith(playing: pl);
+      _safeAdd(stream.playingController, pl);
+      revision.value++;
+    }));
+
+    _fallbackSubs.add(p.stream.buffering.listen((buf) {
+      if (!_isUsingFallback) return;
+      state = state.copyWith(buffering: buf);
+      _safeAdd(stream.bufferingController, buf);
+      revision.value++;
+    }));
+
+    _fallbackSubs.add(p.stream.completed.listen((comp) {
+      if (!_isUsingFallback) return;
+      state = state.copyWith(completed: comp);
+      _safeAdd(stream.completedController, comp);
+      revision.value++;
+    }));
+
+    _fallbackSubs.add(p.stream.error.listen((err) {
+      if (!_isUsingFallback) return;
+      DiaryService.add('[FallbackNativePlayer] 错误: $err');
+      _safeAdd(stream.errorController, err);
+    }));
+
+    _fallbackSubs.add(p.stream.videoParams.listen((vp) {
+      if (!_isUsingFallback) return;
+      state = state.copyWith(
+        width: vp.w ?? 1920,
+        height: vp.h ?? 1080,
+        videoParams: vp,
+      );
+      _safeAdd(stream.videoParamsController, vp);
+      revision.value++;
+    }));
+  }
+
+  Future<void> _openWithFallback(Media media, {bool play = true}) async {
+    _isUsingFallback = true;
+    _positionPollTimer?.cancel();
+
+    // 暂停并释放 ExoPlayer 资源
+    final oldExo = _controller;
+    if (oldExo != null) {
+      if (_valueListener != null) {
+        try {
+          oldExo.removeListener(_valueListener!);
+        } catch (_) {}
+        _valueListener = null;
+      }
+      try {
+        await oldExo.pause();
+      } catch (_) {}
+      try {
+        await oldExo.dispose();
+      } catch (_) {}
+      _controller = null;
+    }
+
+    await _ensureFallbackInitialized();
+    final p = _fallbackPlayer!;
+    final platform = p.platform;
+    if (platform is NativePlayer) {
+      if (Platform.isAndroid) {
+        await platform.setProperty('hwdec', 'mediacodec');
+        await platform.setProperty('hwdec-codecs', 'all');
+        await platform.setProperty('opengl-pbo', 'yes');
+        await platform.setProperty('video-latency-hacks', 'yes');
+        await platform.setProperty('scale', 'bilinear');
+        await platform.setProperty('cscale', 'bilinear');
+        await platform.setProperty('dscale', 'bilinear');
+        await platform.setProperty('correct-downscaling', 'no');
+        await platform.setProperty('vd-lavc-skiploopfilter', 'all');
+        await platform.setProperty('vd-lavc-skipidct', 'all');
+        await platform.setProperty('vd-lavc-threads', '2');
+        await platform.setProperty('demuxer-max-bytes', '${4 * 1024 * 1024}');
+        await platform.setProperty('demuxer-max-back-bytes', '${1 * 1024 * 1024}');
+        await platform.setProperty('demuxer-readahead-secs', '5');
+        await platform.setProperty('vd-lavc-fast', 'yes');
+        await platform.setProperty('video-sync', 'audio');
+        await platform.setProperty('framedrop', 'vo');
+      }
+      final lavfOpts = <String>[
+        'seg_max_retry=3',
+        'strict=experimental',
+        'allowed_extensions=ALL',
+        'protocol_whitelist=[http,https,tcp,tls,crypto,data,file]',
+      ];
+      if (_decryptionKey != null && _decryptionKey!.isNotEmpty) {
+        lavfOpts.add('decryption_key=$_decryptionKey');
+      }
+      await platform.setProperty('demuxer-lavf-o', lavfOpts.join(','));
+      await platform.setProperty('network-timeout', '20');
+    }
+
+    DiaryService.add('[FallbackNativePlayer] 打开媒体: ${media.uri}, cencKey=${_decryptionKey != null && _decryptionKey!.isNotEmpty ? "已注入(长度:${_decryptionKey!.length})" : "无"}');
+    await p.open(media, play: play);
+    revision.value++;
+  }
+
   @override
   Future<void> play() async {
+    if (_isUsingFallback) {
+      await _fallbackPlayer?.play();
+      return;
+    }
     final c = _controller;
     if (c == null) return;
     try {
@@ -405,6 +587,10 @@ class LunaExoPlayer implements Player {
 
   @override
   Future<void> pause() async {
+    if (_isUsingFallback) {
+      await _fallbackPlayer?.pause();
+      return;
+    }
     final c = _controller;
     if (c == null) return;
     try {
@@ -414,6 +600,10 @@ class LunaExoPlayer implements Player {
 
   @override
   Future<void> playOrPause() async {
+    if (_isUsingFallback) {
+      await _fallbackPlayer?.playOrPause();
+      return;
+    }
     final c = _controller;
     if (c == null) return;
     if (c.value.isPlaying) {
@@ -425,6 +615,10 @@ class LunaExoPlayer implements Player {
 
   @override
   Future<void> seek(Duration target) async {
+    if (_isUsingFallback) {
+      await _fallbackPlayer?.seek(target);
+      return;
+    }
     final c = _controller;
     if (c == null) return;
     try {
@@ -443,6 +637,10 @@ class LunaExoPlayer implements Player {
     final r = rate.clamp(0.25, 4.0);
     state = state.copyWith(rate: r);
     _safeAdd(stream.rateController, r);
+    if (_isUsingFallback) {
+      await _fallbackPlayer?.setRate(r);
+      return;
+    }
     final c = _controller;
     if (c == null) return;
     try {
@@ -455,6 +653,10 @@ class LunaExoPlayer implements Player {
     final v = volume.clamp(0.0, 100.0);
     state = state.copyWith(volume: v);
     _safeAdd(stream.volumeController, v);
+    if (_isUsingFallback) {
+      await _fallbackPlayer?.setVolume(v);
+      return;
+    }
     final c = _controller;
     if (c == null) return;
     try {
@@ -464,12 +666,16 @@ class LunaExoPlayer implements Player {
 
   @override
   Future<void> stop() async {
+    if (_isUsingFallback) {
+      await _fallbackPlayer?.stop();
+    }
     final c = _controller;
-    if (c == null) return;
-    try {
-      await c.pause();
-      await c.seekTo(Duration.zero);
-    } catch (_) {}
+    if (c != null) {
+      try {
+        await c.pause();
+        await c.seekTo(Duration.zero);
+      } catch (_) {}
+    }
     state = state.copyWith(
       playing: false,
       buffering: false,
@@ -486,6 +692,18 @@ class LunaExoPlayer implements Player {
   Future<void> dispose() async {
     _disposed = true;
     _positionPollTimer?.cancel();
+    for (final sub in _fallbackSubs) {
+      try {
+        await sub.cancel();
+      } catch (_) {}
+    }
+    _fallbackSubs.clear();
+    if (_fallbackPlayer != null) {
+      try {
+        await _fallbackPlayer!.dispose();
+      } catch (_) {}
+      _fallbackPlayer = null;
+    }
     final c = _controller;
     final listener = _valueListener;
     if (c != null && listener != null) {
@@ -536,25 +754,37 @@ class LunaExoVideoView extends StatelessWidget {
     return AnimatedBuilder(
       animation: player.revision,
       builder: (context, _) {
-        final c = player.controller;
-        final hasVideo = c != null && c.value.isInitialized;
-        final rawRatio = hasVideo ? c.value.aspectRatio : 16 / 9;
-        final ratio = (rawRatio > 0 && !rawRatio.isNaN && !rawRatio.isInfinite)
-            ? rawRatio
-            : 16 / 9;
+        Widget videoWidget;
+        if (player.isUsingFallback && player.fallbackVideoController != null) {
+          videoWidget = Video(
+            controller: player.fallbackVideoController!,
+            fit: fit,
+            controls: (state) => const SizedBox(),
+          );
+        } else {
+          final c = player.controller;
+          final hasVideo = c != null && c.value.isInitialized;
+          final rawRatio = hasVideo ? c.value.aspectRatio : 16 / 9;
+          final ratio = (rawRatio > 0 && !rawRatio.isNaN && !rawRatio.isInfinite)
+              ? rawRatio
+              : 16 / 9;
+
+          if (hasVideo) {
+            videoWidget = Center(
+              child: AspectRatio(
+                aspectRatio: ratio,
+                child: VideoPlayer(c),
+              ),
+            );
+          } else {
+            videoWidget = const ColoredBox(color: Colors.black);
+          }
+        }
 
         return Stack(
           fit: StackFit.expand,
           children: [
-            if (hasVideo)
-              Center(
-                child: AspectRatio(
-                  aspectRatio: ratio,
-                  child: VideoPlayer(c),
-                ),
-              )
-            else
-              const ColoredBox(color: Colors.black),
+            videoWidget,
             if (controls != null) controls!(context),
           ],
         );
