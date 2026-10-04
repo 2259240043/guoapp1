@@ -46,7 +46,7 @@ class LocalStore extends ChangeNotifier {
   int _failures = 0;
   bool _sourcesUnlocked = false;
   bool _gateEnabled = false;
-  bool _gateOff = false;
+  bool _gateOff = true; // 全开版：默认所有站源直接可见，无需密码
   String _gateSalt = '';
   String _gateHash = '';
   DateTime _retryAfter = DateTime(2000);
